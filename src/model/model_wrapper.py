@@ -2015,6 +2015,47 @@ class ModelWrapper(LightningModule):
             },
         }
 
+    def _save_gaussians_packet(self, gaussians, batch, path_root):
+        """
+        保存每个 evaluation sample 的高斯包。
+        只保存 runtime 可信的 world-space 表示：
+        - means
+        - covariances
+        - harmonics
+        - opacities
+        以及元信息：
+        - scene
+        - context indices
+        - target indices
+        - context extrinsics / intrinsics
+        - target extrinsics / intrinsics
+        """
+        path_root.mkdir(exist_ok=True, parents=True)
+
+        scene = batch["scene"][0] if isinstance(batch["scene"], list) else batch["scene"]
+        save_path = path_root / f"{scene}.pt"
+
+        packet = {
+            "scene": scene,
+            "context_index": batch["context"]["index"][0].detach().cpu(),
+            "target_index": batch["target"]["index"][0].detach().cpu(),
+            "target_camera_id": batch["target"]["camera_id"][0].detach().cpu(),
+            "context_extrinsics": batch["context"]["extrinsics"][0].detach().cpu(),
+            "context_intrinsics": batch["context"]["intrinsics"][0].detach().cpu(),
+            "target_extrinsics": batch["target"]["extrinsics"][0].detach().cpu(),
+            "target_intrinsics": batch["target"]["intrinsics"][0].detach().cpu(),
+            "means": gaussians.means[0].detach().cpu(),
+            "covariances": gaussians.covariances[0].detach().cpu(),
+            "harmonics": gaussians.harmonics[0].detach().cpu(),
+            "opacities": gaussians.opacities[0].detach().cpu(),
+            "target_near": batch["target"]["near"][0].detach().cpu(),
+            "target_far": batch["target"]["far"][0].detach().cpu(),
+            "target_image": batch["target"]["image"][0].detach().cpu(),
+            "image_shape": tuple(batch["target"]["image"].shape[-2:]),
+            "background_color": torch.tensor(self.decoder.background_color).detach().cpu(),
+        }
+        
+        torch.save(packet, save_path)
 
 def sliding_window_indices(N, x, y):
     indices = []
@@ -2028,3 +2069,4 @@ def sliding_window_indices(N, x, y):
     indices.append([N - x, N])
     
     return indices
+
