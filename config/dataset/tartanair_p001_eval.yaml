@@ -7,7 +7,7 @@ target_camera: left
 
 sequences:
   - scene: P001
-    root: datasets/tartanair_v2/House/Data_easy/House/Data_easy/P001
+    root: /workspace/MVSplat/mvsplat/datasets/tartanair_v2/House/Data_easy/House/Data_easy/P001
     fx: 320.0
     fy: 320.0
     cx: 320.0
@@ -22,10 +22,8 @@ pose_format: tx_ty_tz_qx_qy_qz_qw
 pose_matrix_type: Twc
 
 view_sampler:
+  index_path: assets/tartanair/house_p001_pairs_contiguous/P001_train.json
   num_context_views: 1
-  train_index_path: assets/tartanair/house_p001_pairs_contiguous/P001_train.json
-  val_index_path: assets/tartanair/house_p001_pairs_contiguous/P001_val.json
-  test_index_path: assets/tartanair/house_p001_pairs_contiguous/P001_test.json
 
 normalize_intrinsics: true
 image_shape: [320, 320]

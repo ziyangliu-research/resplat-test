@@ -48,6 +48,10 @@ class DatasetTartanAirCfg(DatasetCfgCommon):
         "tx_ty_tz_qw_qx_qy_qz",
     ] = "tx_ty_tz_qx_qy_qz_qw"
     pose_matrix_type: Literal["Twc", "Tcw"] = "Twc"
+    pose_align_first_view: bool = False
+    pose_align_middle_view: bool = False
+    center_pose: bool = False
+    scale_extrinsics: float = 1.0
 
     # Intrinsics must be provided explicitly.
     fx: float = 0.0
@@ -209,7 +213,7 @@ class DatasetTartanAir(Dataset):
                 )
         return eval_items
     
-    def _build_stereo_samples_for_sequence(self, seq_cfg: SequenceCfg):
+    def _build_stereo_samples_for_sequence_gt(self, seq_cfg: SequenceCfg):
         left_root = seq_cfg.root / self.cfg.left_camera_dirname
         right_root = seq_cfg.root / self.cfg.right_camera_dirname
         left_pose_path = seq_cfg.root / self.cfg.left_pose_filename
@@ -281,6 +285,168 @@ class DatasetTartanAir(Dataset):
             samples = samples[:: self.cfg.frame_stride]
         return samples
     
+    def _build_stereo_samples_for_sequence(self, seq_cfg: SequenceCfg):
+        """
+        Build stereo samples when only the left camera pose file is available.
+
+        Assumption:
+            - left pose file provides left camera poses.
+            - _load_pose_file(...) returns Twc in the loader's final camera convention.
+            In your current implementation, that means OpenCV camera axes because
+            _build_Twc_from_pose() already applies:
+                Twc = Twc_pose @ T_tartanCam_from_cvCam
+            - right Twc is synthesized by a fixed stereo rig transform.
+
+        Rig convention used here:
+            T_left_tartan_to_right_tartan is the pose of the right camera
+            in the left camera coordinate system, expressed in Tartan/AirSim
+            camera axes:
+                x forward, y right, z down
+
+            For TartanAir front stereo, this is approximately:
+                translation = [0, 0.25, 0]
+            in Tartan camera coordinates.
+
+        Internally we convert this rig transform into OpenCV camera axes:
+            x right, y down, z forward
+
+        Then:
+            Twc_right_cv = Twc_left_cv @ T_left_cv_to_right_cv
+        """
+
+        left_root = seq_cfg.root / self.cfg.left_camera_dirname
+        right_root = seq_cfg.root / self.cfg.right_camera_dirname
+        left_pose_path = seq_cfg.root / self.cfg.left_pose_filename
+
+        left_entries = self._load_image_entries_from_dir(left_root)
+        right_entries = self._load_image_entries_from_dir(right_root)
+        left_poses = self._load_pose_file(left_pose_path)
+
+        n_left_imgs = len(left_entries)
+        n_right_imgs = len(right_entries)
+        n_left_pose = len(left_poses)
+        n = min(n_left_imgs, n_right_imgs, n_left_pose)
+
+        if n == 0:
+            return []
+
+        if self.cfg.strict_length_check:
+            if not (n_left_imgs == n_right_imgs == n_left_pose):
+                raise RuntimeError(
+                    f"Length mismatch in scene={seq_cfg.scene}: "
+                    f"left_imgs={n_left_imgs}, right_imgs={n_right_imgs}, "
+                    f"left_pose={n_left_pose}. "
+                    f"Right pose is not required because it is synthesized from the stereo rig."
+                )
+
+        left_entries = left_entries[:n]
+        right_entries = right_entries[:n]
+        left_poses = left_poses[:n]
+
+        if self.cfg.frame_start > 0:
+            left_entries = left_entries[self.cfg.frame_start :]
+            right_entries = right_entries[self.cfg.frame_start :]
+            left_poses = left_poses[self.cfg.frame_start :]
+
+        if self.cfg.max_frames > 0:
+            left_entries = left_entries[: self.cfg.max_frames]
+            right_entries = right_entries[: self.cfg.max_frames]
+            left_poses = left_poses[: self.cfg.max_frames]
+
+        # ------------------------------------------------------------------
+        # Fixed stereo rig
+        # ------------------------------------------------------------------
+        # Tartan/AirSim camera axes:
+        #   x forward, y right, z down
+        #
+        # OpenCV camera axes:
+        #   x right, y down, z forward
+        #
+        # Your _build_Twc_from_pose() uses exactly this conversion:
+        #   T_tartanCam_from_cvCam
+        # so _load_pose_file() should already return Twc in OpenCV camera axes.
+        # Therefore the rig also needs to be converted into OpenCV axes.
+        # ------------------------------------------------------------------
+
+        dtype = torch.float32
+
+        T_tartanCam_from_cvCam = torch.eye(4, dtype=dtype)
+        T_tartanCam_from_cvCam[:3, :3] = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],  # cv z forward -> tartan x forward
+                [1.0, 0.0, 0.0],  # cv x right   -> tartan y right
+                [0.0, 1.0, 0.0],  # cv y down    -> tartan z down
+            ],
+            dtype=dtype,
+        )
+
+        T_cvCam_from_tartanCam = torch.linalg.inv(T_tartanCam_from_cvCam)
+
+        # Pose of right camera in left camera coordinate, expressed in
+        # Tartan/AirSim camera axes.
+        #
+        # Equivalent to:
+        #   right camera center is +0.25m along left camera's "right" axis.
+        #
+        # If you later add this to yaml, replace 0.25000006 with self.cfg.stereo_baseline.
+        stereo_baseline = 0.25000006
+
+        T_left_tartan_to_right_tartan = torch.eye(4, dtype=dtype)
+        T_left_tartan_to_right_tartan[:3, 3] = torch.tensor(
+            [0.0, stereo_baseline, 0.0],
+            dtype=dtype,
+        )
+
+        # Convert rig transform into OpenCV camera axes.
+        #
+        # Since:
+        #   p_tartan = T_tartanCam_from_cvCam @ p_cv
+        #
+        # The same physical transform represented in CV camera coordinates is:
+        #   T_left_cv_to_right_cv
+        #     = T_cvCam_from_tartanCam
+        #       @ T_left_tartan_to_right_tartan
+        #       @ T_tartanCam_from_cvCam
+        #
+        # This should become approximately translation [0.25, 0, 0] in CV axes.
+        T_left_cv_to_right_cv = (
+            T_cvCam_from_tartanCam
+            @ T_left_tartan_to_right_tartan
+            @ T_tartanCam_from_cvCam
+        )
+
+        K_left = self._build_K(seq_cfg.fx, seq_cfg.fy, seq_cfg.cx, seq_cfg.cy)
+        K_right = self._build_K(seq_cfg.fx, seq_cfg.fy, seq_cfg.cx, seq_cfg.cy)
+
+        samples = []
+        for i, ((_, left_path), (_, right_path), Twc_left) in enumerate(
+            zip(left_entries, right_entries, left_poses)
+        ):
+            Twc_left = Twc_left.to(dtype)
+
+            # Synthesize right camera pose from left pose and fixed rig.
+            Twc_right = Twc_left @ T_left_cv_to_right_cv
+
+            samples.append(
+                {
+                    "timestamp": float(i),
+                    "frame_index": i,
+                    "left_image_path": left_path,
+                    "right_image_path": right_path,
+                    "left_extrinsics": Twc_left,
+                    "right_extrinsics": Twc_right,
+                    "left_K": K_left.clone(),
+                    "right_K": K_right.clone(),
+                    "scene_name": seq_cfg.scene,
+                    "right_pose_source": "computed_from_left_pose_and_fixed_stereo_rig",
+                }
+            )
+
+        if self.cfg.frame_stride > 1:
+            samples = samples[:: self.cfg.frame_stride]
+
+        return samples
+
     def _build_stereo_samples_for_sequence1(self, seq_cfg: SequenceCfg):
         left_root = seq_cfg.root / self.cfg.left_camera_dirname
         right_root = seq_cfg.root / self.cfg.right_camera_dirname
@@ -560,6 +726,9 @@ class DatasetTartanAir(Dataset):
         context_images = []
         context_intrinsics = []
         context_extrinsics = []
+        context_index_expanded = []
+        context_camera_id = []
+
         for i in context_indices.tolist():
             sample = samples[i]
             img_l, K_l = self._process_image_and_K(
@@ -575,10 +744,14 @@ class DatasetTartanAir(Dataset):
             context_extrinsics.extend(
                 [sample["left_extrinsics"], sample["right_extrinsics"]]
             )
+            context_index_expanded.extend([i, i])
+            context_camera_id.extend([0, 1])
 
         context_images = torch.stack(context_images, dim=0)
         context_intrinsics = torch.stack(context_intrinsics, dim=0)
         context_extrinsics = torch.stack(context_extrinsics, dim=0)
+        context_index_expanded = torch.tensor(context_index_expanded, dtype=torch.long)
+        context_camera_id = torch.tensor(context_camera_id, dtype=torch.long)
 
         target_images = []
         target_intrinsics = []
@@ -617,6 +790,38 @@ class DatasetTartanAir(Dataset):
         target_index_expanded = torch.tensor(target_index_expanded, dtype=torch.long)
         target_camera_id = torch.tensor(target_camera_id, dtype=torch.long)
 
+        # Optional pose normalization. Disabled by default.
+        if (
+            self.cfg.pose_align_first_view
+            or self.cfg.pose_align_middle_view
+            or self.cfg.center_pose
+            or self.cfg.scale_extrinsics != 1.0
+        ):
+            all_selected_extrinsics = torch.cat(
+                [context_extrinsics, target_extrinsics],
+                dim=0,
+            )
+
+            if self.cfg.pose_align_first_view:
+                pivot = context_extrinsics[0:1]
+                all_selected_extrinsics = camera_normalization(pivot, all_selected_extrinsics)
+
+            if self.cfg.pose_align_middle_view:
+                mid_index = context_extrinsics.shape[0] // 2
+                pivot = context_extrinsics[mid_index:mid_index + 1]
+                all_selected_extrinsics = camera_normalization(pivot, all_selected_extrinsics)
+
+            if self.cfg.center_pose:
+                all_selected_extrinsics = center_norm_pose(all_selected_extrinsics)
+
+            if self.cfg.scale_extrinsics != 1.0:
+                all_selected_extrinsics = all_selected_extrinsics.clone()
+                all_selected_extrinsics[:, :3, 3] *= float(self.cfg.scale_extrinsics)
+
+            num_context = context_extrinsics.shape[0]
+            context_extrinsics = all_selected_extrinsics[:num_context]
+            target_extrinsics = all_selected_extrinsics[num_context:]
+
         example = {
             "context": {
                 "extrinsics": context_extrinsics,
@@ -624,7 +829,8 @@ class DatasetTartanAir(Dataset):
                 "image": context_images,
                 "near": self._get_bound(self.cfg.near, context_images.shape[0]),
                 "far": self._get_bound(self.cfg.far, context_images.shape[0]),
-                "index": context_indices,
+                "index": context_index_expanded,
+                "camera_id": context_camera_id,
             },
             "target": {
                 "extrinsics": target_extrinsics,
@@ -639,3 +845,26 @@ class DatasetTartanAir(Dataset):
             "scene_name": scene_name,
         }
         return example
+
+def camera_normalization(pivotal_pose: torch.Tensor, poses: torch.Tensor):
+    # pivotal_pose: [1, 4, 4], poses: [N, 4, 4]
+    camera_norm_matrix = torch.inverse(pivotal_pose)
+    poses = torch.bmm(
+        camera_norm_matrix.repeat(poses.shape[0], 1, 1),
+        poses,
+    )
+    return poses
+
+
+def center_norm_pose(extrinsics: torch.Tensor):
+    # extrinsics: [V, 4, 4]
+    cam_centers = extrinsics[:, :3, 3]
+    avg_center = cam_centers.mean(dim=0, keepdim=True)
+    dist = (cam_centers - avg_center).norm(dim=1, keepdim=True)
+    scale = dist.max()
+
+    extrinsics = extrinsics.clone()
+    extrinsics[:, :3, 3] -= avg_center
+    extrinsics[:, :3, 3] /= scale
+
+    return extrinsics

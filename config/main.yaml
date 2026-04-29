@@ -8,7 +8,7 @@ defaults:
 wandb:
   project: resplat
   entity: null
-  name: placeholder
+  name: shiyo-lzy-lab
   mode: online
   id: null
 
@@ -97,6 +97,8 @@ test:
   inference_window_size: null
   profile_model: false
   test_zero_order_sh_only: false
+  save_gaussian_packet: true
+  save_gaussian_packet_stage: final
 
 seed: 111123
 

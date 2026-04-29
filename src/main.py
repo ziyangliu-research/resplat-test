@@ -42,70 +42,148 @@ def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
 
 
+def cfg_get(cfg, key, default=None):
+    """Safe getter for DictConfig / dict / dataclass-like objects."""
+    try:
+        return cfg.get(key, default)
+    except Exception:
+        try:
+            return cfg[key]
+        except Exception:
+            return default
+
+
+def dataset_descriptor(dataset_cfg: DictConfig) -> str:
+    """Build a text descriptor without assuming that every dataset has `roots`.
+
+    Original ReSplat code used `dataset.roots`, which is valid for RE10K/DL3DV
+    but not for custom TartanAir configs that use `root` or `sequences[*].root`.
+    """
+    parts = [str(cfg_get(dataset_cfg, "name", ""))]
+
+    roots = cfg_get(dataset_cfg, "roots", None)
+    if roots is not None:
+        parts.append(str(roots))
+
+    root = cfg_get(dataset_cfg, "root", None)
+    if root is not None:
+        parts.append(str(root))
+
+    sequences = cfg_get(dataset_cfg, "sequences", None)
+    if sequences is not None:
+        try:
+            for seq in sequences:
+                scene = cfg_get(seq, "scene", "")
+                seq_root = cfg_get(seq, "root", "")
+                parts.append(f"{scene}:{seq_root}")
+        except Exception:
+            parts.append(str(sequences))
+
+    return " ".join(parts).lower()
+
+
+def resolve_train_eval_index_path(cfg_dict: DictConfig) -> str:
+    """Resolve the evaluation index used for train-time full test evaluation.
+
+    Priority:
+      1. trainer.eval_index, if explicitly specified.
+      2. Dataset/view-sampler specific paths, for custom datasets such as TartanAir.
+      3. ReSplat's original hard-coded defaults for RE10K/DL3DV/ScanNet.
+    """
+    dataset_cfg = cfg_dict["dataset"]
+    trainer_cfg = cfg_dict["trainer"]
+    view_sampler_cfg = dataset_cfg["view_sampler"]
+
+    trainer_eval_index = cfg_get(trainer_cfg, "eval_index", None)
+    if trainer_eval_index is not None:
+        return str(trainer_eval_index)
+
+    num_context_views = cfg_get(view_sampler_cfg, "num_context_views", None)
+    dataset_name = str(cfg_get(dataset_cfg, "name", "")).lower()
+    dataset_text = dataset_descriptor(dataset_cfg)
+
+    # Custom TartanAir configs generally use sequences/root and often provide
+    # train/val/test index paths directly in the view_sampler config.
+    if dataset_name == "tartanair" or "tartanair" in dataset_text:
+        for key in ("index_path", "test_index_path", "val_index_path", "train_index_path"):
+            value = cfg_get(view_sampler_cfg, key, None)
+            if value is not None:
+                return str(value)
+
+        # Fallback for old two-view TartanAir configs, if present in assets.
+        if num_context_views == 2:
+            return "assets/evaluation_index_tartanair_view2.json"
+
+        raise ValueError(
+            "No evaluation index path found for TartanAir. "
+            "Set trainer.eval_index, or provide dataset.view_sampler.test_index_path "
+            "/ val_index_path / index_path in the dataset config."
+        )
+
+    if "re10k" in dataset_text:
+        if num_context_views == 2:
+            return "assets/evaluation_index_re10k.json"
+        if num_context_views == 4:
+            return "assets/re10k_start_0_distance_150_ctx_4v_tgt_6v.json"
+        if num_context_views == 6:
+            return "assets/re10k_start_0_distance_200_ctx_6v_tgt_6v.json"
+        raise ValueError(f"Unsupported number of context views for RE10K: {num_context_views}")
+
+    if "dl3dv" in dataset_text:
+        if num_context_views == 6:
+            return "assets/dl3dv_start_0_distance_50_ctx_6v_tgt_8v.json"
+        if num_context_views == 2:
+            return "assets/dl3dv_start_0_distance_20_ctx_2v_tgt_4v.json"
+        if num_context_views == 8:
+            return "assets/dl3dv_evaluation/dl3dv_start_0_distance_40_ctx_8v_tgt_8v.json"
+        if num_context_views == 16:
+            return "assets/dl3dv_evaluation/dl3dv_start_0_distance_80_ctx_16v_tgt_16v.json"
+        if num_context_views == 32:
+            return "assets/dl3dv_evaluation/dl3dv_start_0_distance_160_ctx_32v_tgt_24v.json"
+        if num_context_views == 64:
+            return "assets/dl3dv_benchmark/dl3dv_ctx_64v_tgt_every8th.json"
+        raise ValueError(f"Unsupported number of context views for DL3DV: {num_context_views}")
+
+    if "scannet" in dataset_text:
+        if num_context_views == 2:
+            return "assets/evaluation_index_scannet_view2.json"
+        raise ValueError(f"Unsupported number of context views for ScanNet: {num_context_views}")
+
+    raise ValueError(
+        "Fail to resolve eval index path. "
+        "Set trainer.eval_index explicitly, or add dataset-specific logic in main.py."
+    )
+
+
+def build_eval_cfg(cfg_dict: DictConfig):
+    if cfg_dict["mode"] != "train" or cfg_dict["train"]["eval_model_every_n_val"] <= 0:
+        return None
+
+    eval_cfg_dict = copy.deepcopy(cfg_dict)
+    eval_path = resolve_train_eval_index_path(cfg_dict)
+    num_context_views = cfg_get(cfg_dict["dataset"]["view_sampler"], "num_context_views", None)
+    if num_context_views is None:
+        raise ValueError("dataset.view_sampler.num_context_views is required for train-time evaluation.")
+
+    eval_cfg_dict["dataset"]["view_sampler"] = {
+        "name": "evaluation",
+        "index_path": eval_path,
+        "num_context_views": num_context_views,
+    }
+
+    assert eval_cfg_dict["dataset"]["view_sampler"]["index_path"] is not None, (
+        "no evaluation index path found!"
+    )
+    return load_typed_root_config(eval_cfg_dict)
+
+
 @hydra.main(
     version_base=None,
     config_path="../config",
     config_name="main",
 )
 def train(cfg_dict: DictConfig):
-    if cfg_dict["mode"] == "train" and cfg_dict["train"]["eval_model_every_n_val"] > 0:
-        eval_cfg_dict = copy.deepcopy(cfg_dict)
-        dataset_dir = str(cfg_dict["dataset"]["roots"]).lower()
-        if "re10k" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/evaluation_index_re10k.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 4:
-                eval_path = "assets/re10k_start_0_distance_150_ctx_4v_tgt_6v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
-                eval_path = "assets/re10k_start_0_distance_200_ctx_6v_tgt_6v.json"
-            else:
-                if cfg_dict["trainer"]["eval_index"] is not None:
-                    eval_path = None  # placeholder
-                else:
-                    raise ValueError("unsupported number of views for re10k")
-        elif "dl3dv" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
-                eval_path = "assets/dl3dv_start_0_distance_50_ctx_6v_tgt_8v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/dl3dv_start_0_distance_20_ctx_2v_tgt_4v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 8:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_40_ctx_8v_tgt_8v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 16:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_80_ctx_16v_tgt_16v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 32:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_160_ctx_32v_tgt_24v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 64:
-                eval_path = "assets/dl3dv_benchmark/dl3dv_ctx_64v_tgt_every8th.json"
-            else:
-                eval_path = None
-                # raise ValueError("unsupported number of views for dl3dv")
-        elif "scannet" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/evaluation_index_scannet_view2.json"
-            else:
-                raise ValueError("unsupported number of views for scannet")
-        elif "tartanair" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = 'assets/evaluation_index_tartanair_view2.json'
-            else:
-                raise ValueError("unsupported number of views for tartanair")
-        else:
-            raise Exception("Fail to load eval index path")
-        eval_cfg_dict["dataset"]["view_sampler"] = {
-            "name": "evaluation",
-            "index_path": eval_path,
-            "num_context_views": cfg_dict["dataset"]["view_sampler"]["num_context_views"],
-        }
-
-        # specify eval index
-        if cfg_dict["trainer"]["eval_index"] is not None:
-            eval_cfg_dict["dataset"]["view_sampler"]["index_path"] = cfg_dict["trainer"]["eval_index"]
-
-        assert eval_cfg_dict["dataset"]["view_sampler"]["index_path"] is not None, "no evaluation index path found!"
-
-        eval_cfg = load_typed_root_config(eval_cfg_dict)
-    else:
-        eval_cfg = None
+    eval_cfg = build_eval_cfg(cfg_dict)
 
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
@@ -127,7 +205,7 @@ def train(cfg_dict: DictConfig):
         if cfg_dict.wandb.id is not None:
             wandb_extra_kwargs.update({'id': cfg_dict.wandb.id,
                                        'resume': "must"})
-        run_name = os.path.basename(cfg_dict.output_dir)
+        run_name = os.path.basename(str(output_dir))
         if cfg_dict.log_slurm_id:
             run_name += f" ({os.environ.get('SLURM_JOB_ID')})"
         logger = WandbLogger(

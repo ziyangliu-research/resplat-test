@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 try:
     import moviepy.editor as mpy
@@ -98,6 +98,12 @@ class TestCfg:
     inference_window_size: int | None
     profile_model: bool
     test_zero_order_sh_only: bool
+
+    # Added for incremental / packet-fusion experiments.
+    # This saves .pt packets with full camera metadata and runtime Gaussian tensors.
+    save_gaussian_packet: bool = False
+    # init: before ReSplat refinement/update; final: after refinement/update; both: save both.
+    save_gaussian_packet_stage: Literal["init", "final", "both"] = "final"
 
 
 @dataclass
@@ -726,6 +732,7 @@ class ModelWrapper(LightningModule):
 
         pred_depths = None
         depth_gt = None
+        gaussians_before_refine = None
 
         # save input views for visualization
         if self.test_cfg.save_input_images:
@@ -798,6 +805,7 @@ class ModelWrapper(LightningModule):
                     rotations=torch.cat([g.rotations for g in all_gaussians], dim=1),
                     rotations_unnorm=torch.cat([g.rotations_unnorm for g in all_gaussians], dim=1),
                 )
+                gaussians_before_refine = gaussians
 
                 # global refine after simply combining local window gaussians
                 if self.encoder.cfg.num_refine > 0:
@@ -869,6 +877,8 @@ class ModelWrapper(LightningModule):
                         condition_features = gaussians["condition_features"]
                     gaussians = gaussians["gaussians"]
 
+                gaussians_before_refine = gaussians
+
                 # refine
                 if self.encoder.cfg.num_refine > 0:
                     refine_output = self.encoder.forward_update(
@@ -884,7 +894,40 @@ class ModelWrapper(LightningModule):
 
                     output = render_output[-1]
 
-        # save gaussians
+        # save Gaussian packets for offline fusion/rendering.
+        # This is separate from save_gaussian_ply(): packets keep the original
+        # world-space tensors and target camera metadata.
+        if self.test_cfg.save_gaussian_packet:
+            packet_stage = self.test_cfg.save_gaussian_packet_stage
+            if packet_stage not in ("init", "final", "both"):
+                raise ValueError(
+                    "test.save_gaussian_packet_stage must be one of "
+                    f"'init', 'final', or 'both', got {packet_stage!r}."
+                )
+
+            packet_root = Path(get_cfg()["output_dir"]) / "gaussian_packets"
+            use_stage_subdir = packet_stage == "both"
+
+            if packet_stage in ("init", "both"):
+                init_gaussians = gaussians_before_refine if gaussians_before_refine is not None else gaussians
+                self._save_gaussians_packet(
+                    init_gaussians,
+                    batch,
+                    packet_root,
+                    stage="init",
+                    use_stage_subdir=use_stage_subdir,
+                )
+
+            if packet_stage in ("final", "both"):
+                self._save_gaussians_packet(
+                    gaussians,
+                    batch,
+                    packet_root,
+                    stage="final",
+                    use_stage_subdir=use_stage_subdir,
+                )
+
+        # save gaussians as PLY/NPZ for visualization/export.
         if self.test_cfg.save_gaussian:
             scene = batch["scene"][0]
             save_path = Path(get_cfg()['output_dir']) / 'gaussians' / (scene + '.ply')
@@ -2015,47 +2058,114 @@ class ModelWrapper(LightningModule):
             },
         }
 
-    def _save_gaussians_packet(self, gaussians, batch, path_root):
+    @rank_zero_only
+    def _save_gaussians_packet(
+        self,
+        gaussians: Gaussians,
+        batch: BatchedExample,
+        path_root: Path,
+        stage: Literal["init", "final"] = "final",
+        use_stage_subdir: bool = False,
+    ) -> None:
         """
-        保存每个 evaluation sample 的高斯包。
-        只保存 runtime 可信的 world-space 表示：
-        - means
-        - covariances
-        - harmonics
-        - opacities
-        以及元信息：
-        - scene
-        - context indices
-        - target indices
-        - context extrinsics / intrinsics
-        - target extrinsics / intrinsics
+        Save one Resplat Gaussian packet for offline fusion/rendering.
+
+        This is intentionally different from save_gaussian_ply():
+        - keeps the original world-space tensors;
+        - keeps target camera metadata and GT target images;
+        - keeps Resplat/gsplat-specific scale and rotation fields;
+        - saves .pt so the packet can be loaded without PLY parsing or
+          coordinate-system ambiguity.
+
+        If use_stage_subdir=True, packets are saved under:
+            path_root / stage / f"{scene}.pt"
+        Otherwise, packets are saved directly under:
+            path_root / f"{scene}.pt"
         """
+        if stage not in ("init", "final"):
+            raise ValueError(f"stage must be 'init' or 'final', got {stage!r}.")
+
+        path_root = path_root / stage if use_stage_subdir else path_root
         path_root.mkdir(exist_ok=True, parents=True)
 
-        scene = batch["scene"][0] if isinstance(batch["scene"], list) else batch["scene"]
+        scene_value = batch["scene"]
+        if isinstance(scene_value, (list, tuple)):
+            scene = scene_value[0]
+        else:
+            scene = scene_value
+
         save_path = path_root / f"{scene}.pt"
 
+        if "camera_id" in batch["target"]:
+            target_camera_id = batch["target"]["camera_id"][0].detach().cpu()
+        else:
+            target_camera_id = torch.zeros_like(
+                batch["target"]["index"][0].detach().cpu()
+            )
+
+        background_color = getattr(self.decoder, "background_color", None)
+        if background_color is None:
+            background_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+        elif torch.is_tensor(background_color):
+            background_color = background_color.detach().cpu()
+        else:
+            background_color = torch.tensor(background_color, dtype=torch.float32)
+
         packet = {
+            # identifiers
             "scene": scene,
+            "packet_stage": stage,
             "context_index": batch["context"]["index"][0].detach().cpu(),
             "target_index": batch["target"]["index"][0].detach().cpu(),
-            "target_camera_id": batch["target"]["camera_id"][0].detach().cpu(),
+            "target_camera_id": target_camera_id,
+
+            # context cameras
             "context_extrinsics": batch["context"]["extrinsics"][0].detach().cpu(),
             "context_intrinsics": batch["context"]["intrinsics"][0].detach().cpu(),
+            "context_near": batch["context"]["near"][0].detach().cpu(),
+            "context_far": batch["context"]["far"][0].detach().cpu(),
+
+            # target cameras / GT
             "target_extrinsics": batch["target"]["extrinsics"][0].detach().cpu(),
             "target_intrinsics": batch["target"]["intrinsics"][0].detach().cpu(),
-            "means": gaussians.means[0].detach().cpu(),
-            "covariances": gaussians.covariances[0].detach().cpu(),
-            "harmonics": gaussians.harmonics[0].detach().cpu(),
-            "opacities": gaussians.opacities[0].detach().cpu(),
             "target_near": batch["target"]["near"][0].detach().cpu(),
             "target_far": batch["target"]["far"][0].detach().cpu(),
             "target_image": batch["target"]["image"][0].detach().cpu(),
             "image_shape": tuple(batch["target"]["image"].shape[-2:]),
-            "background_color": torch.tensor(self.decoder.background_color).detach().cpu(),
+
+            # renderer background
+            "background_color": background_color,
+
+            # Resplat Gaussian fields
+            "means": gaussians.means[0].detach().cpu(),
+            "covariances": (
+                gaussians.covariances[0].detach().cpu()
+                if gaussians.covariances is not None
+                else None
+            ),
+            "harmonics": gaussians.harmonics[0].detach().cpu(),
+            "opacities": gaussians.opacities[0].detach().cpu(),
+
+            # Resplat / gsplat required fields
+            "scales": (
+                gaussians.scales[0].detach().cpu()
+                if gaussians.scales is not None
+                else None
+            ),
+            "rotations": (
+                gaussians.rotations[0].detach().cpu()
+                if gaussians.rotations is not None
+                else None
+            ),
+            "rotations_unnorm": (
+                gaussians.rotations_unnorm[0].detach().cpu()
+                if gaussians.rotations_unnorm is not None
+                else None
+            ),
         }
-        
+
         torch.save(packet, save_path)
+        # print(f"[GaussianPacket:{stage}] saved: {save_path}")
 
 def sliding_window_indices(N, x, y):
     indices = []

@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -14,8 +15,9 @@ from jaxtyping import install_import_hook
 with install_import_hook(("src",), ("beartype", "beartype")):
     from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
     from src.misc.image_io import prep_image, save_image, save_video
-    from src.model.decoder.cuda_splatting import render_cuda
     from src.model.types import Gaussians
+
+from gsplat.rendering import rasterization
 
 
 REQUIRED_PACKET_FIELDS = {
@@ -24,6 +26,9 @@ REQUIRED_PACKET_FIELDS = {
     "covariances",
     "harmonics",
     "opacities",
+    "scales",
+    "rotations",
+    "rotations_unnorm",
     "target_extrinsics",
     "target_intrinsics",
     "target_near",
@@ -74,7 +79,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--packet_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--max_packets", type=int, required=True)
+    parser.add_argument(
+        "--max_packets",
+        type=int,
+        default=None,
+        help="Use the first N packets after sorting. Ignored if --packet_ranges is set.",
+    )
+
+    parser.add_argument(
+        "--packet_ranges",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated packet index ranges after filename sorting, e.g. "
+            "'0-20,300-500' or '0-20,35,300-500'. Inclusive ranges."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--compute_lpips",
@@ -215,7 +235,7 @@ def resolve_device(device_str: str) -> torch.device:
 
     if device.type != "cuda":
         raise RuntimeError(
-            "This script uses diff_gaussian_rasterization via render_cuda(), which is CUDA-only. "
+            "This script uses gsplat rasterization, which is expected to run on CUDA. "
             f"Requested device='{device_str}'. Please use a CUDA device such as 'cuda:0'."
         )
 
@@ -255,7 +275,15 @@ def validate_packet(packet: dict[str, Any], path: Path) -> None:
     if not isinstance(packet["scene"], str):
         raise TypeError(f"Packet '{path}' field 'scene' must be a string.")
 
-    for field in ("means", "covariances", "harmonics", "opacities"):
+    tensor_fields = (
+        "means",
+        "harmonics",
+        "opacities",
+        "scales",
+        "rotations",
+        "rotations_unnorm",
+    )
+    for field in tensor_fields:
         if not isinstance(packet[field], torch.Tensor):
             raise TypeError(f"Packet '{path}' field '{field}' must be a torch.Tensor.")
 
@@ -263,13 +291,19 @@ def validate_packet(packet: dict[str, Any], path: Path) -> None:
     covariances = packet["covariances"]
     harmonics = packet["harmonics"]
     opacities = packet["opacities"]
+    scales = packet["scales"]
+    rotations = packet["rotations"]
+    rotations_unnorm = packet["rotations_unnorm"]
 
     if means.ndim != 2 or means.shape[-1] != 3:
         raise ValueError(f"Packet '{path}' has invalid means shape {tuple(means.shape)}.")
-    if covariances.ndim != 3 or covariances.shape[-2:] != (3, 3):
-        raise ValueError(
-            f"Packet '{path}' has invalid covariances shape {tuple(covariances.shape)}."
-        )
+    if covariances is not None:
+        if not isinstance(covariances, torch.Tensor):
+            raise TypeError(f"Packet '{path}' field 'covariances' must be a tensor or None.")
+        if covariances.ndim != 3 or covariances.shape[-2:] != (3, 3):
+            raise ValueError(
+                f"Packet '{path}' has invalid covariances shape {tuple(covariances.shape)}."
+            )
     if harmonics.ndim != 3 or harmonics.shape[1] != 3:
         raise ValueError(
             f"Packet '{path}' has invalid harmonics shape {tuple(harmonics.shape)}."
@@ -278,14 +312,33 @@ def validate_packet(packet: dict[str, Any], path: Path) -> None:
         raise ValueError(
             f"Packet '{path}' has invalid opacities shape {tuple(opacities.shape)}."
         )
+    if scales.ndim != 2 or scales.shape[-1] != 3:
+        raise ValueError(f"Packet '{path}' has invalid scales shape {tuple(scales.shape)}.")
+    if rotations.ndim != 2 or rotations.shape[-1] != 4:
+        raise ValueError(f"Packet '{path}' has invalid rotations shape {tuple(rotations.shape)}.")
+    if rotations_unnorm.ndim != 2 or rotations_unnorm.shape[-1] != 4:
+        raise ValueError(
+            f"Packet '{path}' has invalid rotations_unnorm shape {tuple(rotations_unnorm.shape)}."
+        )
 
     num_gaussians = means.shape[0]
-    if covariances.shape[0] != num_gaussians:
-        raise ValueError(f"Packet '{path}' gaussian field lengths do not match.")
-    if harmonics.shape[0] != num_gaussians:
-        raise ValueError(f"Packet '{path}' gaussian field lengths do not match.")
-    if opacities.shape[0] != num_gaussians:
-        raise ValueError(f"Packet '{path}' gaussian field lengths do not match.")
+    for field_name, field_value in (
+        ("harmonics", harmonics),
+        ("opacities", opacities),
+        ("scales", scales),
+        ("rotations", rotations),
+        ("rotations_unnorm", rotations_unnorm),
+    ):
+        if field_value.shape[0] != num_gaussians:
+            raise ValueError(
+                f"Packet '{path}' gaussian field lengths do not match: "
+                f"means has {num_gaussians}, {field_name} has {field_value.shape[0]}."
+            )
+    if covariances is not None and covariances.shape[0] != num_gaussians:
+        raise ValueError(
+            f"Packet '{path}' gaussian field lengths do not match: "
+            f"means has {num_gaussians}, covariances has {covariances.shape[0]}."
+        )
 
     context_index = packet["context_index"]
     target_index = packet["target_index"]
@@ -357,21 +410,112 @@ def validate_packet(packet: dict[str, Any], path: Path) -> None:
             f"Packet '{path}' has invalid background_color shape {tuple(background_color.shape)}."
         )
 
+def parse_packet_ranges(spec: str, num_packets: int) -> list[int]:
+    """
+    Parse a range spec over sorted packet indices.
+    Example:
+      "0-20,300-500" -> [0,1,...,20,300,...,500]
+      "0-20,35,100-120" also works.
 
-def load_packets(packet_dir: Path, max_packets: int | None = None) -> list[LoadedPacket]:
+    Ranges are inclusive.
+    Duplicate indices are removed while preserving order.
+    """
+    if spec is None or spec.strip() == "":
+        raise ValueError("Empty --packet_ranges spec.")
+
+    selected: list[int] = []
+    seen: set[int] = set()
+
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            pieces = part.split("-")
+            if len(pieces) != 2:
+                raise ValueError(f"Invalid packet range item: '{part}'")
+            start = int(pieces[0])
+            end = int(pieces[1])
+            if start > end:
+                raise ValueError(f"Invalid packet range '{part}': start > end")
+            indices = range(start, end + 1)
+        else:
+            idx = int(part)
+            indices = [idx]
+
+        for idx in indices:
+            if idx < 0 or idx >= num_packets:
+                raise IndexError(
+                    f"Packet index {idx} out of range. "
+                    f"Available sorted packet indices: 0..{num_packets - 1}"
+                )
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+
+    if not selected:
+        raise ValueError(f"No packet indices selected from --packet_ranges='{spec}'")
+
+    return selected
+
+
+def select_packet_paths(
+    packet_dir: Path,
+    max_packets: int | None,
+    packet_ranges: str | None,
+) -> list[Path]:
     if not packet_dir.exists():
         raise FileNotFoundError(f"packet_dir does not exist: {packet_dir}")
     if not packet_dir.is_dir():
         raise NotADirectoryError(f"packet_dir is not a directory: {packet_dir}")
 
-    packet_paths = sorted(packet_dir.glob("*.pt"))
-    if not packet_paths:
+    packet_paths_all = sorted(packet_dir.glob("*.pt"))
+    if not packet_paths_all:
         raise FileNotFoundError(f"No .pt packets found under: {packet_dir}")
 
-    if max_packets is not None:
-        packet_paths = packet_paths[:max_packets]
+    if packet_ranges is not None:
+        selected_indices = parse_packet_ranges(packet_ranges, len(packet_paths_all))
+        packet_paths = [packet_paths_all[i] for i in selected_indices]
+        print(
+            f"Selected {len(packet_paths)} packet(s) by ranges '{packet_ranges}' "
+            f"from {len(packet_paths_all)} available packet(s).",
+            flush=True,
+        )
+        print(
+            "Selected sorted packet indices: "
+            + ",".join(str(i) for i in selected_indices[:30])
+            + ("..." if len(selected_indices) > 30 else ""),
+            flush=True,
+        )
+        return packet_paths
 
-    print(f"Loading {len(packet_paths)} packet(s) from {packet_dir}", flush=True)
+    if max_packets is None:
+        raise ValueError("Either --max_packets or --packet_ranges must be specified.")
+
+    if max_packets <= 0:
+        raise ValueError(f"--max_packets must be > 0, got {max_packets}")
+
+    packet_paths = packet_paths_all[:max_packets]
+    print(
+        f"Selected first {len(packet_paths)} packet(s) "
+        f"from {len(packet_paths_all)} available packet(s).",
+        flush=True,
+    )
+    return packet_paths
+
+def load_packets(
+    packet_dir: Path,
+    max_packets: int | None = None,
+    packet_ranges: str | None = None,
+) -> list[LoadedPacket]:
+    packet_paths = select_packet_paths(
+        packet_dir=packet_dir,
+        max_packets=max_packets,
+        packet_ranges=packet_ranges,
+    )
+
+    print(f"Loading {len(packet_paths)} selected packet(s) from {packet_dir}", flush=True)
 
     loaded_packets: list[LoadedPacket] = []
     for path in packet_paths:
@@ -418,20 +562,50 @@ def validate_packet_collection(packets: list[LoadedPacket]) -> tuple[int, int]:
             f"{sorted(harmonic_dims)}."
         )
 
+    scale_dims = {tuple(packet.data["scales"].shape[1:]) for packet in packets}
+    rotation_dims = {tuple(packet.data["rotations_unnorm"].shape[1:]) for packet in packets}
+    if scale_dims != {(3,)}:
+        raise ValueError(f"All packets must have scales with trailing shape (3,), got {sorted(scale_dims)}.")
+    if rotation_dims != {(4,)}:
+        raise ValueError(
+            f"All packets must have rotations_unnorm with trailing shape (4,), got {sorted(rotation_dims)}."
+        )
+
     return next(iter(image_shapes))
+
+
+def _cat_optional_tensor(
+    packets: list[LoadedPacket],
+    key: str,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    values = [packet.data.get(key, None) for packet in packets]
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError(
+            f"Some packets have '{key}' but others have None. This mixed state is unsupported."
+        )
+    return torch.cat(values, dim=0).to(device)
 
 
 def concat_fused_gaussians(packets: list[LoadedPacket], device: torch.device) -> Gaussians:
     means = torch.cat([packet.data["means"] for packet in packets], dim=0).to(device)
-    covariances = torch.cat([packet.data["covariances"] for packet in packets], dim=0).to(device)
+    covariances = _cat_optional_tensor(packets, "covariances", device)
     harmonics = torch.cat([packet.data["harmonics"] for packet in packets], dim=0).to(device)
     opacities = torch.cat([packet.data["opacities"] for packet in packets], dim=0).to(device)
+    scales = torch.cat([packet.data["scales"] for packet in packets], dim=0).to(device)
+    rotations = torch.cat([packet.data["rotations"] for packet in packets], dim=0).to(device)
+    rotations_unnorm = torch.cat([packet.data["rotations_unnorm"] for packet in packets], dim=0).to(device)
 
     return Gaussians(
         means=means.unsqueeze(0).contiguous(),
-        covariances=covariances.unsqueeze(0).contiguous(),
+        covariances=None if covariances is None else covariances.unsqueeze(0).contiguous(),
         harmonics=harmonics.unsqueeze(0).contiguous(),
         opacities=opacities.unsqueeze(0).contiguous(),
+        scales=scales.unsqueeze(0).contiguous(),
+        rotations=rotations.unsqueeze(0).contiguous(),
+        rotations_unnorm=rotations_unnorm.unsqueeze(0).contiguous(),
     )
 
 
@@ -454,8 +628,8 @@ def save_progress_video_safe(
     frames_dir = path.parent / f"{path.stem}_frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # for i, frame in enumerate(frames):
-    #     save_image(frame.detach().cpu().float(), frames_dir / f"frame_{i:04d}.png")
+    for i, frame in enumerate(frames):
+        save_image(frame.detach().cpu().float(), frames_dir / f"frame_{i:04d}.png")
 
     return False, f"Saved PNG frame sequence to {frames_dir}"
 
@@ -479,30 +653,72 @@ def render_fused_views(
     probes: list[ProbeView],
     device: torch.device,
 ) -> torch.Tensor:
+    """Render fused Resplat/GSplat Gaussians for one or more probe views.
+
+    This mirrors src/model/decoder/gsplat_decoder_splatting_cuda.py:
+    - extrinsics are Twc and are inverted into view matrices.
+    - intrinsics in packets/config are normalized and are scaled by image width/height.
+    - harmonics are converted from [B, G, 3, D] to [B, G, D, 3].
+    """
     image_shapes = {probe.image_shape for probe in probes}
     if len(image_shapes) != 1:
         raise ValueError(f"All probes must share the same image_shape, got {sorted(image_shapes)}.")
     image_shape = next(iter(image_shapes))
+    height, width = image_shape
 
     extrinsics = torch.stack([probe.extrinsics for probe in probes], dim=0).to(device=device, dtype=torch.float32)
     intrinsics = torch.stack([probe.intrinsics for probe in probes], dim=0).to(device=device, dtype=torch.float32)
     near = torch.stack([probe.near.reshape(()) for probe in probes], dim=0).to(device=device, dtype=torch.float32)
     far = torch.stack([probe.far.reshape(()) for probe in probes], dim=0).to(device=device, dtype=torch.float32)
-    background = torch.stack([probe.background_color.reshape(-1) for probe in probes], dim=0).to(device=device, dtype=torch.float32)
 
-    num_views = len(probes)
-    return render_cuda(
-        extrinsics=extrinsics.contiguous(),
-        intrinsics=intrinsics.contiguous(),
-        near=near.contiguous(),
-        far=far.contiguous(),
-        image_shape=image_shape,
-        background_color=background.contiguous(),
-        gaussian_means=fused.means.expand(num_views, -1, -1).contiguous(),
-        gaussian_covariances=fused.covariances.expand(num_views, -1, -1, -1).contiguous(),
-        gaussian_sh_coefficients=fused.harmonics.expand(num_views, -1, -1, -1).contiguous(),
-        gaussian_opacities=fused.opacities.expand(num_views, -1).contiguous(),
+    # Resplat's GSplat decoder expects batch dimension first: [B, V, ...].
+    extrinsics_b = extrinsics.unsqueeze(0).contiguous()  # [1, V, 4, 4]
+    intrinsics_b = intrinsics.unsqueeze(0).clone().contiguous()  # [1, V, 3, 3]
+    intrinsics_b[:, :, 0] *= width
+    intrinsics_b[:, :, 1] *= height
+    viewmats = extrinsics_b.inverse().contiguous()
+
+    colors = fused.harmonics.permute(0, 1, 3, 2).contiguous()  # [1, G, D_sh, 3]
+    sh_degree = int(math.sqrt(colors.shape[-2])) - 1
+    if (sh_degree + 1) ** 2 != colors.shape[-2]:
+        raise ValueError(
+            f"Invalid SH dimension {colors.shape[-2]}; expected a square number like 1, 4, 9, 16."
+        )
+
+    if fused.scales is None:
+        raise ValueError("Resplat/GSplat rendering requires fused.scales, but it is None.")
+    if fused.rotations_unnorm is None:
+        raise ValueError("Resplat/GSplat rendering requires fused.rotations_unnorm, but it is None.")
+
+    # The Resplat decoder uses scalar near/far from the first view. For mixed probes,
+    # using min(near) and max(far) is safer because it avoids accidentally clipping views.
+    near_plane = float(near.min().item())
+    far_plane = float(far.max().item())
+
+    render_colors, render_alphas, meta = rasterization(
+        means=fused.means.contiguous(),
+        quats=fused.rotations_unnorm.contiguous(),
+        scales=fused.scales.contiguous(),
+        opacities=fused.opacities.contiguous(),
+        colors=colors,
+        sh_degree=sh_degree,
+        viewmats=viewmats,
+        Ks=intrinsics_b,
+        width=int(width),
+        height=int(height),
+        near_plane=near_plane,
+        far_plane=far_plane,
+        eps2d=0.1,
+        rasterize_mode="antialiased",
+        packed=True,
+        absgrad=False,
+        sparse_grad=False,
+        render_mode="RGB+ED",
+        covars=None if fused.covariances is None else fused.covariances.contiguous(),
     )
+
+    # render_colors: [B, V, H, W, 4] for RGB+ED. Return [V, 3, H, W].
+    return render_colors[0, ..., :3].permute(0, 3, 1, 2).contiguous()
 
 
 @torch.no_grad()
@@ -540,7 +756,7 @@ def build_packet_last_only_probes(prefix_packets: list[LoadedPacket]) -> list[Pr
     for i in range(packet.data["target_image"].shape[0]):
         target_index = int(packet.data["target_index"][i].item())
         camera_id = int(packet.data["target_camera_id"][i].item())
-        label = f"packet_last_target_{target_index:06d}_{'left' if camera_id == 0 else 'right'}"
+        label = f"packet_last_target_{target_index:04d}_{'left' if camera_id == 0 else 'right'}"
         probes.append(
             ProbeView(
                 label=label,
@@ -1076,19 +1292,21 @@ def probes_for_prefix(
 
 def main() -> None:
     args = parse_args()
-    if args.max_packets <= 0:
+    if args.max_packets is not None and args.max_packets <= 0:
         raise ValueError(f"--max_packets must be > 0, got {args.max_packets}")
 
+    if args.max_packets is None and args.packet_ranges is None:
+        raise ValueError("Either --max_packets or --packet_ranges must be specified.")
+
     device = resolve_device(args.device)
-    packets = load_packets(args.packet_dir, max_packets=args.max_packets)
+    packets = load_packets(
+        args.packet_dir,
+        max_packets=args.max_packets,
+        packet_ranges=args.packet_ranges,
+    )
     packet_image_shape = validate_packet_collection(packets)
 
-    max_packets = min(args.max_packets, len(packets))
-    if max_packets < args.max_packets:
-        print(
-            f"Requested max_packets={args.max_packets}, but only found {len(packets)} packet(s). "
-            f"Processing {max_packets} prefix step(s)."
-        )
+    max_packets = len(packets)
 
     fixed_probe, fixed_probe_sequence = build_probes(args, packets)
     if fixed_probe is not None:
@@ -1144,7 +1362,8 @@ def main() -> None:
         per_view_metrics: list[dict[str, Any]] = []
 
         for render_idx, (probe, rendered_image) in enumerate(zip(probes, rendered)):
-            filename = f"k_{k:03d}_{probe.label}.png"
+            # filename = f"k_{k:03d}_{probe.label}.png"
+            filename = f"{probe.label}.png"
             save_png_tensor(rendered_image, images_dir / filename)
             rendered_filenames.append(filename)
 
@@ -1202,13 +1421,13 @@ def main() -> None:
                 curve_lpips.append(mean_lpips)
                 step_summary["metrics_mean"]["lpips"] = mean_lpips
                 log_message += f", LPIPS={mean_lpips:.4f}"
-            print(log_message)
+            # print(log_message)
         else:
             log_message = (
                 f"[{k}/{max_packets}] fused {k} packet(s) -> {int(fused.means.shape[1])} gaussians, "
                 f"rendered {len(rendered_filenames)} probe view(s), no GT available."
             )
-            print(log_message)
+            # print(log_message)
 
         summary_steps.append(step_summary)
 
@@ -1258,6 +1477,8 @@ def main() -> None:
         "packet_dir": str(args.packet_dir),
         "output_dir": str(args.output_dir),
         "probe_mode": args.probe_mode,
+        "packet_ranges": args.packet_ranges,
+        "selected_packet_count": len(packets),
         "compute_lpips": bool(args.compute_lpips),
         "device": str(device),
         "available_packets": len(packets),
@@ -1297,8 +1518,8 @@ def main() -> None:
     print(f"Saved summary to {summary_path}")
     print(f"Saved plots to {plots_dir}")
     if args.save_progress_video:
-        for message in video_save_messages:
-            print(message)
+        # for message in video_save_messages:
+            # print(message)
         print(f"Saved video-related outputs under {videos_dir}")
 
 
