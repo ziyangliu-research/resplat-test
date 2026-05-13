@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /dataset: tartanair_p000_eval
+  - override /dataset: tartanair_zipmap_demo
   - override /model/encoder: resplat
   - override /loss: [mse, lpips]
 
@@ -45,7 +45,7 @@ loss:
     perceptual_loss: true
 
 dataset:
-  image_shape: [256,256]
+  image_shape: [320,320]
   near: 0.1
   far: 50.0
   frame_stride: 1

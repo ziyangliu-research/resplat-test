@@ -7,7 +7,7 @@ target_camera: left
 
 sequences:
   - scene: P000
-    root: /workspace/MVSplat/mvsplat/datasets/tartanair_v2/House/Data_easy/House/Data_easy/P000
+    root: /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000
     fx: 320.0
     fy: 320.0
     cx: 320.0
@@ -17,17 +17,17 @@ left_camera_dirname: image_lcam_front
 # left_pose_filename: pose.txt
 right_camera_dirname: image_rcam_front
 left_pose_filename: pose_lcam_front.txt
-# right_pose_filename: pose_rcam_front.txt
+right_pose_filename: pose_rcam_front.txt
 
 pose_format: tx_ty_tz_qx_qy_qz_qw
 pose_matrix_type: Twc
 
 view_sampler:
-  index_path: assets/tartanair/house_p000_pairs/P000_train.json
+  index_path: assets/tartanair/house_p000_pairs_interval/P000_test.json
   num_context_views: 1
 
 normalize_intrinsics: true
-image_shape: [256,256]
+image_shape: [320,320]
 background_color: [0.0, 0.0, 0.0]
 cameras_are_circular: false
 overfit_to_scene: null

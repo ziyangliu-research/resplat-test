@@ -13,6 +13,8 @@ class ResNetFeatureWarpper(nn.Module):
 
         if resnet_layers == 18:
             resnet = resnet18(pretrained=True)
+            # from torchvision.models import resnet18, ResNet18_Weights
+            # resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         elif resnet_layers == 34:
             resnet = resnet34(pretrained=True)
         elif resnet_layers == 50:
